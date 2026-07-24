@@ -1,44 +1,69 @@
 """
-콘크리트 압축강도 예측 대시보드
-================================
-Day 4-5 프로젝트에서 학습한 모델(기본값: XGBoost 튜닝 모델)을 사용하는
-Streamlit 대시보드입니다.
+AI-Assisted Concrete Mix Design Platform
+========================================
 
-실행 방법:
+Streamlit prototype for:
+- AI-based compressive strength prediction
+- Training-range reliability checks
+- Mix comparison
+- Cost and GWP assessment
+- Laboratory validation with actual results
+
+Run:
     pip install -r requirements.txt
     streamlit run app.py
 
-모델 파일이 없어도 실행은 되지만(데모 모드, 근사 공식 사용), 실제 예측 정확도를
-위해서는 model.pkl과 scaler.pkl을 이 파일과 같은 폴더에 두세요.
-(model.pkl / scaler.pkl 만드는 방법은 save_model_snippet.py 참고)
+Required model files:
+    model.pkl
+    scaler.pkl
+
+Important:
+- Mix inputs and validation CSV files must use RAW engineering units.
+- The app applies scaler.pkl internally before prediction.
+- Cost and GWP factors are placeholders and must be replaced with verified
+  project, supplier, or EPD data before practical use.
 """
 
+from __future__ import annotations
+
 import os
+from typing import Any
+
+import joblib
 import numpy as np
 import pandas as pd
-import streamlit as st
-import plotly.graph_objects as go
 import plotly.express as px
-
-try:
-    import joblib
-except ImportError:
-    joblib = None
+import plotly.graph_objects as go
+import streamlit as st
 
 
 # ============================================================
-# 기본 설정
+# PAGE CONFIGURATION
 # ============================================================
 st.set_page_config(
-    page_title="콘크리트 압축강도 예측 대시보드",
+    page_title="AI-Assisted Concrete Mix Design Platform",
     page_icon="🧱",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+
+# ============================================================
+# CONSTANTS
+# ============================================================
 FEATURE_COLUMNS = [
-    "cement", "blast_furnace_slag", "fly_ash", "water",
-    "superplasticizer", "coarse_aggregate", "fine_aggregate", "age",
+    "cement",
+    "blast_furnace_slag",
+    "fly_ash",
+    "water",
+    "superplasticizer",
+    "coarse_aggregate",
+    "fine_aggregate",
+    "age",
 ]
+
+TARGET_COLUMN = "concrete_compressive_strength"
+
 FEATURE_LABELS_KR = {
     "cement": "시멘트",
     "blast_furnace_slag": "고로 슬래그",
@@ -49,13 +74,18 @@ FEATURE_LABELS_KR = {
     "fine_aggregate": "잔 골재",
     "age": "양생 기간",
 }
+
 FEATURE_UNITS = {
-    "cement": "kg/m³", "blast_furnace_slag": "kg/m³", "fly_ash": "kg/m³",
-    "water": "kg/m³", "superplasticizer": "kg/m³", "coarse_aggregate": "kg/m³",
-    "fine_aggregate": "kg/m³", "age": "일",
+    "cement": "kg/m³",
+    "blast_furnace_slag": "kg/m³",
+    "fly_ash": "kg/m³",
+    "water": "kg/m³",
+    "superplasticizer": "kg/m³",
+    "coarse_aggregate": "kg/m³",
+    "fine_aggregate": "kg/m³",
+    "age": "일",
 }
-# Day 4 EDA에서 확인한 학습 데이터의 실제 범위 (min, max) — 슬라이더 기본값 및
-# "훈련 범위 밖" 경고에 사용. 본인 데이터의 실제 min/max로 교체하세요.
+
 TRAIN_RANGES = {
     "cement": (100.0, 540.0),
     "blast_furnace_slag": (0.0, 359.0),
@@ -66,370 +96,769 @@ TRAIN_RANGES = {
     "fine_aggregate": (594.0, 992.0),
     "age": (1.0, 365.0),
 }
+
 DEFAULT_MIX = {
-    "cement": 300.0, "blast_furnace_slag": 60.0, "fly_ash": 30.0,
-    "water": 180.0, "superplasticizer": 6.0, "coarse_aggregate": 970.0,
-    "fine_aggregate": 780.0, "age": 28.0,
+    "cement": 300.0,
+    "blast_furnace_slag": 60.0,
+    "fly_ash": 30.0,
+    "water": 180.0,
+    "superplasticizer": 6.0,
+    "coarse_aggregate": 970.0,
+    "fine_aggregate": 780.0,
+    "age": 28.0,
 }
 
-# 재료별 단가($/kg)와 GWP(kgCO2e/kg) 기본값 — 업계 평균을 참고한 예시값입니다.
-# 실제 프로젝트에서는 지역·공급업체별 실제 단가/EPD(환경성적표지) 데이터로 교체하세요.
+SLIDER_STEP = {
+    "cement": 5.0,
+    "blast_furnace_slag": 5.0,
+    "fly_ash": 5.0,
+    "water": 1.0,
+    "superplasticizer": 0.5,
+    "coarse_aggregate": 5.0,
+    "fine_aggregate": 5.0,
+    "age": 1.0,
+}
+
+MATERIAL_FEATURES = [feature for feature in FEATURE_COLUMNS if feature != "age"]
+
+# Placeholder values only.
 DEFAULT_COST_PER_KG = {
-    "cement": 0.12, "blast_furnace_slag": 0.03, "fly_ash": 0.02,
-    "water": 0.001, "superplasticizer": 2.00, "coarse_aggregate": 0.015,
+    "cement": 0.12,
+    "blast_furnace_slag": 0.03,
+    "fly_ash": 0.02,
+    "water": 0.001,
+    "superplasticizer": 2.00,
+    "coarse_aggregate": 0.015,
     "fine_aggregate": 0.015,
 }
-DEFAULT_GWP_PER_KG = {  # kg CO2e / kg material
-    "cement": 0.90, "blast_furnace_slag": 0.03, "fly_ash": 0.02,
-    "water": 0.0003, "superplasticizer": 1.20, "coarse_aggregate": 0.007,
+
+DEFAULT_GWP_PER_KG = {
+    "cement": 0.90,
+    "blast_furnace_slag": 0.03,
+    "fly_ash": 0.02,
+    "water": 0.0003,
+    "superplasticizer": 1.20,
+    "coarse_aggregate": 0.007,
     "fine_aggregate": 0.007,
 }
-MIX_FEATURES = [c for c in FEATURE_COLUMNS if c != "age"]  # cost/GWP는 age 제외 7개 재료 기준
 
 
 # ============================================================
-# 모델 로딩
+# MODEL AND CALCULATION FUNCTIONS
 # ============================================================
 @st.cache_resource
-def load_model_and_scaler():
-    """model.pkl / scaler.pkl 을 시도해서 불러온다. 없으면 (None, None) 반환."""
-    model, scaler = None, None
-    if joblib is not None:
-        if os.path.exists("model.pkl"):
-            try:
-                model = joblib.load("model.pkl")
-            except Exception as e:
-                st.warning(f"model.pkl 로드 실패: {e}")
-        if os.path.exists("scaler.pkl"):
-            try:
-                scaler = joblib.load("scaler.pkl")
-            except Exception as e:
-                st.warning(f"scaler.pkl 로드 실패: {e}")
-    return model, scaler
+def load_model_and_scaler() -> tuple[Any | None, Any | None, str | None]:
+    """Load model.pkl and scaler.pkl from the app directory."""
+    model_path = "model.pkl"
+    scaler_path = "scaler.pkl"
+
+    if not os.path.exists(model_path):
+        return None, None, "model.pkl 파일을 찾을 수 없습니다."
+    if not os.path.exists(scaler_path):
+        return None, None, "scaler.pkl 파일을 찾을 수 없습니다."
+
+    try:
+        model = joblib.load(model_path)
+        scaler = joblib.load(scaler_path)
+        return model, scaler, None
+    except Exception as exc:
+        return None, None, f"모델 또는 스케일러 로드 실패: {exc}"
 
 
-def demo_formula_predict(mix: dict) -> float:
-    """model.pkl이 없을 때 사용하는 아주 단순한 근사 공식 (데모 전용).
-    실제 학습된 모델과 무관하며, 대시보드 기능을 시연하기 위한 대체값입니다."""
-    c = mix["cement"]
-    w = mix["water"]
-    a = mix["age"]
-    binder = c + mix["blast_furnace_slag"] + mix["fly_ash"]
-    wb_ratio = w / max(binder, 1e-6)
-    # Abrams' law 스타일의 대략적인 근사식 (데모 목적)
-    base = 100.0 / (1.5 ** (wb_ratio * 3))
-    age_factor = np.log1p(a) / np.log1p(28)
-    strength = base * min(age_factor, 1.3)
-    return float(np.clip(strength, 2, 85))
+def demo_formula_predict(mix: dict[str, float]) -> float:
+    """Fallback demonstration formula used only when the trained model is unavailable."""
+    binder = (
+        mix["cement"]
+        + mix["blast_furnace_slag"]
+        + mix["fly_ash"]
+    )
+    wb_ratio = mix["water"] / max(binder, 1e-6)
+    age_factor = np.log1p(mix["age"]) / np.log1p(28)
+    base_strength = 100.0 / (1.5 ** (wb_ratio * 3))
+    return float(np.clip(base_strength * min(age_factor, 1.3), 2.0, 85.0))
 
 
-def predict_strength(mix: dict, model, scaler) -> tuple[float, bool]:
-    """예측 강도(MPa)와 '실제 모델 사용 여부'를 반환."""
-    if model is not None and scaler is not None:
-        X = pd.DataFrame([[mix[c] for c in FEATURE_COLUMNS]], columns=FEATURE_COLUMNS)
-        X_scaled = scaler.transform(X)
-        pred = model.predict(X_scaled)[0]
-        return float(pred), True
-    return demo_formula_predict(mix), False
+def prepare_raw_input_frame(mix: dict[str, float]) -> pd.DataFrame:
+    """Create one-row raw-input dataframe in the exact training feature order."""
+    return pd.DataFrame(
+        [[float(mix[column]) for column in FEATURE_COLUMNS]],
+        columns=FEATURE_COLUMNS,
+    )
 
 
-def out_of_range_warnings(mix: dict) -> list[str]:
-    warnings = []
-    for feat, (lo, hi) in TRAIN_RANGES.items():
-        v = mix[feat]
-        if v < lo or v > hi:
+def predict_strength(
+    mix: dict[str, float],
+    model: Any | None,
+    scaler: Any | None,
+) -> tuple[float, bool]:
+    """Return predicted strength and whether the trained model was used."""
+    if model is None or scaler is None:
+        return demo_formula_predict(mix), False
+
+    raw_input = prepare_raw_input_frame(mix)
+    scaled_input = scaler.transform(raw_input)
+    prediction = model.predict(scaled_input)
+    return float(prediction[0]), True
+
+
+def predict_dataframe(
+    raw_features: pd.DataFrame,
+    model: Any,
+    scaler: Any,
+) -> np.ndarray:
+    """
+    Predict from RAW engineering-unit inputs.
+
+    This intentionally applies scaler.transform exactly once.
+    """
+    ordered = raw_features[FEATURE_COLUMNS].astype(float)
+    scaled = scaler.transform(ordered)
+    return np.asarray(model.predict(scaled), dtype=float)
+
+
+def get_out_of_range_rows(mix: dict[str, float]) -> list[dict[str, str | float]]:
+    """Return human-readable training-range warnings."""
+    warnings: list[dict[str, str | float]] = []
+
+    for feature, (minimum, maximum) in TRAIN_RANGES.items():
+        value = float(mix[feature])
+        if value < minimum or value > maximum:
             warnings.append(
-                f"**{FEATURE_LABELS_KR[feat]}** = {v:g}{FEATURE_UNITS[feat]} — "
-                f"학습 데이터 범위({lo:g}~{hi:g}) 밖입니다. 이 구간의 예측은 신뢰도가 낮을 수 있습니다."
+                {
+                    "변수": FEATURE_LABELS_KR[feature],
+                    "입력값": value,
+                    "단위": FEATURE_UNITS[feature],
+                    "학습 범위": f"{minimum:g}–{maximum:g}",
+                }
             )
+
     return warnings
 
 
-def compute_cost_gwp(mix: dict, cost_table: dict, gwp_table: dict) -> tuple[float, float]:
-    total_cost = sum(mix[f] * cost_table[f] for f in MIX_FEATURES)
-    total_gwp = sum(mix[f] * gwp_table[f] for f in MIX_FEATURES)
-    return total_cost, total_gwp
+def compute_cost_and_gwp(
+    mix: dict[str, float],
+    cost_factors: dict[str, float],
+    gwp_factors: dict[str, float],
+) -> tuple[float, float]:
+    """Calculate indicative material cost and GWP per cubic metre."""
+    total_cost = sum(mix[f] * cost_factors[f] for f in MATERIAL_FEATURES)
+    total_gwp = sum(mix[f] * gwp_factors[f] for f in MATERIAL_FEATURES)
+    return float(total_cost), float(total_gwp)
+
+
+def calculate_validation_metrics(
+    actual: pd.Series,
+    predicted: np.ndarray,
+) -> dict[str, float]:
+    """Calculate R², RMSE, and MAE without additional dependencies."""
+    actual_values = actual.astype(float).to_numpy()
+    residuals = actual_values - predicted
+
+    rmse = float(np.sqrt(np.mean(residuals**2)))
+    mae = float(np.mean(np.abs(residuals)))
+    ss_res = float(np.sum(residuals**2))
+    ss_tot = float(np.sum((actual_values - actual_values.mean()) ** 2))
+    r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+
+    return {"R²": r2, "RMSE": rmse, "MAE": mae}
+
+
+def reset_saved_mixes() -> None:
+    st.session_state.saved_mixes = []
 
 
 # ============================================================
-# 세션 상태 초기화
+# SESSION STATE
 # ============================================================
 if "saved_mixes" not in st.session_state:
-    st.session_state.saved_mixes = []  # list of dicts: {name, mix, pred, cost, gwp}
+    st.session_state.saved_mixes = []
 
-if "cost_table" not in st.session_state:
-    st.session_state.cost_table = DEFAULT_COST_PER_KG.copy()
+if "cost_factors" not in st.session_state:
+    st.session_state.cost_factors = DEFAULT_COST_PER_KG.copy()
 
-if "gwp_table" not in st.session_state:
-    st.session_state.gwp_table = DEFAULT_GWP_PER_KG.copy()
+if "gwp_factors" not in st.session_state:
+    st.session_state.gwp_factors = DEFAULT_GWP_PER_KG.copy()
 
 
-model, scaler = load_model_and_scaler()
-USING_REAL_MODEL = model is not None and scaler is not None
+model, scaler, model_error = load_model_and_scaler()
+using_trained_model = model is not None and scaler is not None
 
 
 # ============================================================
-# 사이드바 — 재료 단가 / GWP 계수 설정 (모든 탭에서 공유)
+# SIDEBAR
 # ============================================================
 with st.sidebar:
-    st.header("⚙️ 설정")
+    st.header("⚙️ Platform Settings")
 
-    if USING_REAL_MODEL:
-        st.success("학습된 모델(model.pkl) 사용 중")
+    if using_trained_model:
+        st.success("XGBoost model and scaler connected")
     else:
-        st.warning("model.pkl 없음 — 데모 근사 공식 사용 중\n(실제 프로젝트 모델을 연결하세요)")
-
-    st.markdown("---")
-    st.subheader("재료 단가 ($/kg)")
-    for f in MIX_FEATURES:
-        st.session_state.cost_table[f] = st.number_input(
-            FEATURE_LABELS_KR[f], min_value=0.0,
-            value=float(st.session_state.cost_table[f]), step=0.001, format="%.3f",
-            key=f"cost_{f}",
+        st.error(model_error or "학습 모델을 사용할 수 없습니다.")
+        st.warning(
+            "현재 데모 근사식으로 실행됩니다. 실제 발표용 배포에서는 "
+            "model.pkl과 scaler.pkl을 반드시 포함하세요."
         )
 
-    st.markdown("---")
-    st.subheader("GWP 계수 (kgCO₂e/kg)")
-    for f in MIX_FEATURES:
-        st.session_state.gwp_table[f] = st.number_input(
-            FEATURE_LABELS_KR[f], min_value=0.0,
-            value=float(st.session_state.gwp_table[f]), step=0.01, format="%.3f",
-            key=f"gwp_{f}",
+    st.divider()
+    st.subheader("Material Cost Factors")
+    st.caption("단위: $/kg · 실제 공급업체 단가로 교체")
+
+    for feature in MATERIAL_FEATURES:
+        st.session_state.cost_factors[feature] = st.number_input(
+            FEATURE_LABELS_KR[feature],
+            min_value=0.0,
+            value=float(st.session_state.cost_factors[feature]),
+            step=0.001,
+            format="%.3f",
+            key=f"cost_{feature}",
         )
-    st.caption("⚠️ 위 단가/GWP 값은 예시입니다. 실제 지역·공급업체 데이터로 교체하세요.")
+
+    st.divider()
+    st.subheader("Material GWP Factors")
+    st.caption("단위: kgCO₂e/kg · 검증된 EPD 데이터로 교체")
+
+    for feature in MATERIAL_FEATURES:
+        st.session_state.gwp_factors[feature] = st.number_input(
+            FEATURE_LABELS_KR[feature],
+            min_value=0.0,
+            value=float(st.session_state.gwp_factors[feature]),
+            step=0.001,
+            format="%.3f",
+            key=f"gwp_{feature}",
+        )
+
+    st.divider()
+    st.caption(
+        "Prototype note: cost and GWP outputs are indicative until verified "
+        "regional price and EPD datasets are connected."
+    )
 
 
 # ============================================================
-# 헤더
+# HEADER AND PLATFORM OVERVIEW
 # ============================================================
-st.title("🧱 콘크리트 압축강도 예측 대시보드")
-st.caption("Day 4–5 프로젝트 · UCI Concrete Compressive Strength 데이터 기반")
+st.title("🧱 AI-Assisted Concrete Mix Design Platform")
+st.markdown(
+    """
+    **콘크리트 배합 설계를 위한 AI 기반 엔지니어링 의사결정 지원 프로토타입**
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🔮 예측", "⚖️ 배합 비교", "📈 실측 vs 예측", "💰 비용 & GWP",
-])
+    압축강도 예측뿐 아니라 **배합 비교, 비용, GWP, 실험 결과 검증**을 하나의
+    workflow로 연결합니다.
+    """
+)
+
+overview_1, overview_2, overview_3, overview_4, overview_5 = st.columns(5)
+overview_1.metric("AI Prediction", "Strength")
+overview_2.metric("Reliability", "Range Check")
+overview_3.metric("Decision Support", "Mix Compare")
+overview_4.metric("Sustainability", "Cost + GWP")
+overview_5.metric("Validation", "Actual vs AI")
+
+st.info(
+    "AI 결과는 후보 배합 검토를 지원하기 위한 참고 정보입니다. "
+    "최종 판단에는 재료 품질, 배합 시험, 시공성 및 현장 검증이 필요합니다."
+)
 
 
 # ============================================================
-# TAB 1 — 예측
+# MAIN TABS
 # ============================================================
-with tab1:
-    st.subheader("배합 입력")
-    col_input, col_result = st.columns([1.3, 1])
+tab_design, tab_compare, tab_validation, tab_sustainability = st.tabs(
+    [
+        "🧪 Mix Design & AI Evaluation",
+        "⚖️ Alternative Comparison",
+        "📈 Laboratory Validation",
+        "🌱 Cost & Sustainability",
+    ]
+)
 
-    with col_input:
-        mix = {}
-        c1, c2 = st.columns(2)
-        SLIDER_STEP = {
-            "cement": 5.0, "blast_furnace_slag": 5.0, "fly_ash": 5.0,
-            "water": 1.0, "superplasticizer": 0.5, "coarse_aggregate": 5.0,
-            "fine_aggregate": 5.0, "age": 1.0,
-        }
-        for i, feat in enumerate(FEATURE_COLUMNS):
-            lo, hi = TRAIN_RANGES[feat]
-            target_col = c1 if i % 2 == 0 else c2
-            mix[feat] = target_col.slider(
-                f"{FEATURE_LABELS_KR[feat]} ({FEATURE_UNITS[feat]})",
-                min_value=float(lo * 0.5), max_value=float(hi * 1.3),
-                value=float(DEFAULT_MIX[feat]), step=SLIDER_STEP[feat],
-                key=f"pred_{feat}",
+
+# ============================================================
+# TAB 1 — MIX DESIGN & AI EVALUATION
+# ============================================================
+with tab_design:
+    st.subheader("Mix Design Input")
+
+    input_column, result_column = st.columns([1.35, 1])
+
+    with input_column:
+        current_mix: dict[str, float] = {}
+        input_left, input_right = st.columns(2)
+
+        for index, feature in enumerate(FEATURE_COLUMNS):
+            minimum, maximum = TRAIN_RANGES[feature]
+            widget_column = input_left if index % 2 == 0 else input_right
+
+            current_mix[feature] = widget_column.slider(
+                f"{FEATURE_LABELS_KR[feature]} ({FEATURE_UNITS[feature]})",
+                min_value=float(minimum * 0.5),
+                max_value=float(maximum * 1.3),
+                value=float(DEFAULT_MIX[feature]),
+                step=float(SLIDER_STEP[feature]),
+                key=f"mix_input_{feature}",
             )
 
-        mix_name = st.text_input("배합 이름 (비교 탭에 저장할 때 사용)", value="배합 A")
-        save_clicked = st.button("💾 이 배합을 비교 목록에 저장", use_container_width=True)
+        mix_name = st.text_input(
+            "배합 이름",
+            value="Candidate Mix A",
+            help="저장 후 Alternative Comparison 탭에서 여러 배합을 비교할 수 있습니다.",
+        )
 
-    pred, is_real = predict_strength(mix, model, scaler)
-    cost, gwp = compute_cost_gwp(mix, st.session_state.cost_table, st.session_state.gwp_table)
+    predicted_strength, used_real_model = predict_strength(
+        current_mix,
+        model,
+        scaler,
+    )
+    estimated_cost, estimated_gwp = compute_cost_and_gwp(
+        current_mix,
+        st.session_state.cost_factors,
+        st.session_state.gwp_factors,
+    )
 
-    with col_result:
-        st.metric("예측 압축강도", f"{pred:.1f} MPa")
-        m1, m2 = st.columns(2)
-        m1.metric("배합 비용 (1m³ 기준)", f"${cost:.2f}")
-        m2.metric("GWP (1m³ 기준)", f"{gwp:.1f} kgCO₂e")
+    binder = (
+        current_mix["cement"]
+        + current_mix["blast_furnace_slag"]
+        + current_mix["fly_ash"]
+    )
+    water_binder_ratio = current_mix["water"] / max(binder, 1e-6)
 
-        if not is_real:
-            st.info("현재 데모 근사 공식으로 계산되었습니다. model.pkl / scaler.pkl을 연결하면 실제 XGBoost 모델 예측으로 바뀝니다.")
+    with result_column:
+        st.markdown("#### AI Evaluation")
 
-        warns = out_of_range_warnings(mix)
-        if warns:
-            with st.expander(f"⚠️ 학습 범위 밖 입력 {len(warns)}건", expanded=True):
-                for w in warns:
-                    st.markdown(f"- {w}")
+        st.metric(
+            "Predicted Compressive Strength",
+            f"{predicted_strength:.1f} MPa",
+        )
 
-    if save_clicked:
-        st.session_state.saved_mixes.append({
-            "name": mix_name, "mix": mix.copy(), "pred": pred, "cost": cost, "gwp": gwp,
-        })
-        st.success(f"'{mix_name}' 배합이 저장되었습니다 — '⚖️ 배합 비교' 탭에서 확인하세요.")
+        result_1, result_2 = st.columns(2)
+        result_1.metric("Estimated Cost", f"${estimated_cost:.2f}/m³")
+        result_2.metric("Estimated GWP", f"{estimated_gwp:.1f} kgCO₂e/m³")
+
+        result_3, result_4 = st.columns(2)
+        result_3.metric("Total Binder", f"{binder:.1f} kg/m³")
+        result_4.metric("Water/Binder Ratio", f"{water_binder_ratio:.3f}")
+
+        if not used_real_model:
+            st.warning("현재 결과는 데모 근사식입니다.")
+
+        range_warnings = get_out_of_range_rows(current_mix)
+
+        if range_warnings:
+            st.error(
+                f"{len(range_warnings)}개 입력값이 학습 데이터 범위를 벗어났습니다. "
+                "해당 예측은 외삽(extrapolation)이므로 신뢰도가 낮을 수 있습니다."
+            )
+            st.dataframe(
+                pd.DataFrame(range_warnings),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.success("모든 입력값이 학습 데이터 범위 안에 있습니다.")
+
+        if st.button(
+            "💾 Save Candidate Mix",
+            use_container_width=True,
+            type="primary",
+        ):
+            st.session_state.saved_mixes.append(
+                {
+                    "name": mix_name.strip() or f"Mix {len(st.session_state.saved_mixes) + 1}",
+                    "mix": current_mix.copy(),
+                    "predicted_strength": predicted_strength,
+                    "cost": estimated_cost,
+                    "gwp": estimated_gwp,
+                    "wb_ratio": water_binder_ratio,
+                    "in_training_range": not bool(range_warnings),
+                }
+            )
+            st.success(f"'{mix_name}' 배합을 비교 목록에 저장했습니다.")
 
 
 # ============================================================
-# TAB 2 — 배합 비교
+# TAB 2 — ALTERNATIVE COMPARISON
 # ============================================================
-with tab2:
-    st.subheader("저장된 배합 비교")
+with tab_compare:
+    st.subheader("Candidate Mix Comparison")
+    st.caption(
+        "후보 배합의 강도, 비용, 탄소 효율을 동시에 검토합니다."
+    )
 
     if not st.session_state.saved_mixes:
-        st.info("아직 저장된 배합이 없습니다. '🔮 예측' 탭에서 배합을 만들고 저장해보세요.")
+        st.info(
+            "저장된 후보 배합이 없습니다. Mix Design & AI Evaluation 탭에서 "
+            "2개 이상의 배합을 저장하세요."
+        )
     else:
-        rows = []
-        for m in st.session_state.saved_mixes:
-            row = {"이름": m["name"], "예측 강도(MPa)": round(m["pred"], 1),
-                   "비용($/m³)": round(m["cost"], 2), "GWP(kgCO₂e/m³)": round(m["gwp"], 1)}
-            row["강도/비용 효율"] = round(m["pred"] / max(m["cost"], 1e-6), 2)
-            row["강도/GWP 효율"] = round(m["pred"] / max(m["gwp"], 1e-6), 3)
-            rows.append(row)
-        df_compare = pd.DataFrame(rows)
+        comparison_rows = []
 
-        st.dataframe(df_compare, use_container_width=True, hide_index=True)
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            fig = go.Figure()
-            fig.add_trace(go.Bar(x=df_compare["이름"], y=df_compare["예측 강도(MPa)"],
-                                  marker_color="#1E2761", name="예측 강도"))
-            fig.update_layout(title="배합별 예측 압축강도", yaxis_title="MPa", height=380)
-            st.plotly_chart(fig, use_container_width=True)
-        with col_b:
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(x=df_compare["이름"], y=df_compare["비용($/m³)"],
-                                   marker_color="#FF6B35", name="비용", yaxis="y"))
-            fig2.add_trace(go.Scatter(x=df_compare["이름"], y=df_compare["GWP(kgCO₂e/m³)"],
-                                       mode="lines+markers", name="GWP", yaxis="y2",
-                                       marker_color="#2C5F2D"))
-            fig2.update_layout(
-                title="배합별 비용 vs GWP",
-                yaxis=dict(title="비용 ($/m³)"),
-                yaxis2=dict(title="GWP (kgCO₂e/m³)", overlaying="y", side="right"),
-                height=380,
+        for saved in st.session_state.saved_mixes:
+            comparison_rows.append(
+                {
+                    "Mix": saved["name"],
+                    "Predicted Strength (MPa)": round(saved["predicted_strength"], 2),
+                    "Cost ($/m³)": round(saved["cost"], 2),
+                    "GWP (kgCO₂e/m³)": round(saved["gwp"], 2),
+                    "W/B": round(saved["wb_ratio"], 3),
+                    "Strength / Cost": round(
+                        saved["predicted_strength"] / max(saved["cost"], 1e-6),
+                        3,
+                    ),
+                    "Strength / GWP": round(
+                        saved["predicted_strength"] / max(saved["gwp"], 1e-6),
+                        4,
+                    ),
+                    "Within Training Range": "Yes" if saved["in_training_range"] else "No",
+                }
             )
-            st.plotly_chart(fig2, use_container_width=True)
 
-        best_value = df_compare.loc[df_compare["강도/비용 효율"].idxmax(), "이름"]
-        best_gwp = df_compare.loc[df_compare["강도/GWP 효율"].idxmax(), "이름"]
-        st.success(f"💰 비용 대비 강도 효율 최고: **{best_value}**  ·  🌱 GWP 대비 강도 효율 최고: **{best_gwp}**")
+        comparison_df = pd.DataFrame(comparison_rows)
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
 
-        if st.button("🗑️ 저장된 배합 전체 삭제"):
-            st.session_state.saved_mixes = []
+        chart_left, chart_right = st.columns(2)
+
+        with chart_left:
+            strength_chart = px.bar(
+                comparison_df,
+                x="Mix",
+                y="Predicted Strength (MPa)",
+                text_auto=".1f",
+                title="Predicted Strength by Candidate Mix",
+            )
+            strength_chart.update_layout(height=390)
+            st.plotly_chart(strength_chart, use_container_width=True)
+
+        with chart_right:
+            pareto_chart = px.scatter(
+                comparison_df,
+                x="GWP (kgCO₂e/m³)",
+                y="Predicted Strength (MPa)",
+                size="Cost ($/m³)",
+                color="Mix",
+                hover_data=[
+                    "Cost ($/m³)",
+                    "W/B",
+                    "Strength / Cost",
+                    "Strength / GWP",
+                ],
+                title="Strength–Carbon–Cost Trade-off",
+            )
+            pareto_chart.update_layout(height=390)
+            st.plotly_chart(pareto_chart, use_container_width=True)
+
+        best_strength = comparison_df.loc[
+            comparison_df["Predicted Strength (MPa)"].idxmax(),
+            "Mix",
+        ]
+        best_cost_efficiency = comparison_df.loc[
+            comparison_df["Strength / Cost"].idxmax(),
+            "Mix",
+        ]
+        best_carbon_efficiency = comparison_df.loc[
+            comparison_df["Strength / GWP"].idxmax(),
+            "Mix",
+        ]
+
+        summary_1, summary_2, summary_3 = st.columns(3)
+        summary_1.success(f"Highest Strength\n\n**{best_strength}**")
+        summary_2.success(f"Best Strength / Cost\n\n**{best_cost_efficiency}**")
+        summary_3.success(f"Best Strength / GWP\n\n**{best_carbon_efficiency}**")
+
+        st.warning(
+            "최고 강도 배합이 반드시 최적 배합을 의미하지 않습니다. "
+            "요구 성능, 재료 가용성, 시공성, 비용 및 환경영향을 함께 검토해야 합니다."
+        )
+
+        if st.button("🗑️ Clear Saved Mixes"):
+            reset_saved_mixes()
             st.rerun()
 
 
 # ============================================================
-# TAB 3 — 실측 vs 예측
+# TAB 3 — LABORATORY VALIDATION
 # ============================================================
-with tab3:
-    st.subheader("실측값 vs 예측값 비교")
-    st.caption("Day 4의 test_processed.csv 형식(8개 feature + concrete_compressive_strength 컬럼)의 CSV를 업로드하세요.")
+with tab_validation:
+    st.subheader("Laboratory Validation")
+    st.markdown(
+        """
+        새로운 배합의 **실측 강도와 AI 예측값을 비교**하여 모델 성능을 지속적으로
+        확인할 수 있습니다.
 
-    uploaded = st.file_uploader("CSV 업로드", type=["csv"])
+        업로드 CSV는 반드시 **스케일링 전 원본 단위**를 사용해야 합니다.
+        """
+    )
 
-    if uploaded is not None:
+    template_df = pd.DataFrame(
+        [
+            {
+                **DEFAULT_MIX,
+                TARGET_COLUMN: 40.0,
+            }
+        ]
+    )
+
+    st.download_button(
+        "⬇️ Download Validation CSV Template",
+        data=template_df.to_csv(index=False).encode("utf-8-sig"),
+        file_name="validation_template_raw_units.csv",
+        mime="text/csv",
+    )
+
+    uploaded_file = st.file_uploader(
+        "Validation CSV Upload",
+        type=["csv"],
+        help=(
+            "필수 입력 컬럼: 8개 배합 변수. "
+            "성능 지표 계산을 위해 concrete_compressive_strength 컬럼도 포함하세요."
+        ),
+    )
+
+    if uploaded_file is not None:
         try:
-            df_up = pd.read_csv(uploaded)
-        except Exception as e:
-            st.error(f"CSV를 읽을 수 없습니다: {e}")
-            df_up = None
+            validation_df = pd.read_csv(uploaded_file)
+        except Exception as exc:
+            st.error(f"CSV 파일을 읽을 수 없습니다: {exc}")
+            validation_df = None
 
-        if df_up is not None:
-            target_col = "concrete_compressive_strength"
-            missing = [c for c in FEATURE_COLUMNS if c not in df_up.columns]
-            if missing:
-                st.error(f"다음 컬럼이 CSV에 없습니다: {missing}")
+        if validation_df is not None:
+            missing_features = [
+                feature
+                for feature in FEATURE_COLUMNS
+                if feature not in validation_df.columns
+            ]
+
+            if missing_features:
+                st.error(
+                    "다음 필수 컬럼이 없습니다: "
+                    + ", ".join(missing_features)
+                )
+            elif not using_trained_model:
+                st.error(
+                    "검증 기능에는 실제 model.pkl과 scaler.pkl이 필요합니다."
+                )
             else:
-                preds = []
-                for _, row in df_up.iterrows():
-                    mix_row = {f: row[f] for f in FEATURE_COLUMNS}
-                    p, _ = predict_strength(mix_row, model, scaler)
-                    preds.append(p)
-                df_up["predicted"] = preds
+                try:
+                    validation_predictions = predict_dataframe(
+                        validation_df[FEATURE_COLUMNS],
+                        model,
+                        scaler,
+                    )
+                except Exception as exc:
+                    st.error(f"예측 처리 중 오류가 발생했습니다: {exc}")
+                    validation_predictions = None
 
-                if target_col in df_up.columns:
-                    y_true = df_up[target_col]
-                    y_pred = df_up["predicted"]
-                    residuals = y_true - y_pred
-                    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-                    mae = float(np.mean(np.abs(residuals)))
-                    ss_res = float(np.sum(residuals ** 2))
-                    ss_tot = float(np.sum((y_true - y_true.mean()) ** 2))
-                    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                if validation_predictions is not None:
+                    validation_result = validation_df.copy()
+                    validation_result["predicted_strength"] = validation_predictions
 
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("R²", f"{r2:.4f}")
-                    m2.metric("RMSE", f"{rmse:.3f} MPa")
-                    m3.metric("MAE", f"{mae:.3f} MPa")
+                    if TARGET_COLUMN in validation_result.columns:
+                        metrics = calculate_validation_metrics(
+                            validation_result[TARGET_COLUMN],
+                            validation_predictions,
+                        )
+                        validation_result["residual"] = (
+                            validation_result[TARGET_COLUMN]
+                            - validation_result["predicted_strength"]
+                        )
+                        validation_result["absolute_error"] = validation_result[
+                            "residual"
+                        ].abs()
 
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        fig = px.scatter(df_up, x=target_col, y="predicted",
-                                          labels={target_col: "실제값 (MPa)", "predicted": "예측값 (MPa)"},
-                                          title="Actual vs Predicted")
-                        lo, hi = float(y_true.min()), float(y_true.max())
-                        fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines",
-                                                  line=dict(color="red", dash="dash"), name="perfect fit"))
-                        st.plotly_chart(fig, use_container_width=True)
-                    with col_b:
-                        fig2 = px.histogram(residuals, nbins=30, labels={"value": "Residual (실제-예측)"},
-                                             title="Residual 분포")
-                        fig2.add_vline(x=0, line_color="red", line_dash="dash")
-                        st.plotly_chart(fig2, use_container_width=True)
-                else:
-                    st.info("업로드한 CSV에 실제값 컬럼이 없어 예측값만 표시합니다.")
-                    st.dataframe(df_up, use_container_width=True)
+                        metric_1, metric_2, metric_3 = st.columns(3)
+                        metric_1.metric("R²", f"{metrics['R²']:.4f}")
+                        metric_2.metric("RMSE", f"{metrics['RMSE']:.3f} MPa")
+                        metric_3.metric("MAE", f"{metrics['MAE']:.3f} MPa")
 
-    st.markdown("---")
-    st.subheader("단건 수동 비교")
-    c1, c2, c3 = st.columns(3)
-    manual_actual = c1.number_input("실제 측정 강도 (MPa)", min_value=0.0, value=40.0, step=0.5)
-    manual_pred = c2.number_input("예측 강도 (MPa)", min_value=0.0, value=float(pred), step=0.5)
-    diff = manual_actual - manual_pred
-    c3.metric("차이 (실제 - 예측)", f"{diff:+.2f} MPa", delta=f"{(diff/max(manual_actual,1e-6))*100:+.1f}%")
+                        validation_left, validation_right = st.columns(2)
+
+                        with validation_left:
+                            actual_min = float(
+                                validation_result[TARGET_COLUMN].min()
+                            )
+                            actual_max = float(
+                                validation_result[TARGET_COLUMN].max()
+                            )
+
+                            actual_predicted_chart = px.scatter(
+                                validation_result,
+                                x=TARGET_COLUMN,
+                                y="predicted_strength",
+                                labels={
+                                    TARGET_COLUMN: "Actual Strength (MPa)",
+                                    "predicted_strength": "Predicted Strength (MPa)",
+                                },
+                                title="Actual vs Predicted",
+                                hover_data=["absolute_error"],
+                            )
+                            actual_predicted_chart.add_trace(
+                                go.Scatter(
+                                    x=[actual_min, actual_max],
+                                    y=[actual_min, actual_max],
+                                    mode="lines",
+                                    line={"color": "red", "dash": "dash"},
+                                    name="Ideal 1:1 Line",
+                                )
+                            )
+                            st.plotly_chart(
+                                actual_predicted_chart,
+                                use_container_width=True,
+                            )
+
+                        with validation_right:
+                            residual_chart = px.histogram(
+                                validation_result,
+                                x="residual",
+                                nbins=30,
+                                labels={"residual": "Residual (Actual − Predicted)"},
+                                title="Residual Distribution",
+                            )
+                            residual_chart.add_vline(
+                                x=0,
+                                line_color="red",
+                                line_dash="dash",
+                            )
+                            st.plotly_chart(
+                                residual_chart,
+                                use_container_width=True,
+                            )
+
+                        st.markdown("#### Largest Prediction Errors")
+                        largest_errors = validation_result.nlargest(
+                            min(10, len(validation_result)),
+                            "absolute_error",
+                        )
+                        display_columns = (
+                            FEATURE_COLUMNS
+                            + [
+                                TARGET_COLUMN,
+                                "predicted_strength",
+                                "residual",
+                                "absolute_error",
+                            ]
+                        )
+                        st.dataframe(
+                            largest_errors[display_columns],
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        st.download_button(
+                            "⬇️ Download Validation Results",
+                            data=validation_result.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="validation_results.csv",
+                            mime="text/csv",
+                        )
+                    else:
+                        st.info(
+                            f"'{TARGET_COLUMN}' 컬럼이 없어 예측값만 생성했습니다."
+                        )
+                        st.dataframe(
+                            validation_result,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+    st.divider()
+    st.markdown("#### Single-Test Comparison")
+
+    single_1, single_2, single_3 = st.columns(3)
+    measured_strength = single_1.number_input(
+        "Measured Strength (MPa)",
+        min_value=0.0,
+        value=40.0,
+        step=0.5,
+    )
+    ai_strength = single_2.number_input(
+        "AI Prediction (MPa)",
+        min_value=0.0,
+        value=float(predicted_strength),
+        step=0.5,
+    )
+
+    difference = measured_strength - ai_strength
+    percentage_difference = (
+        difference / measured_strength * 100
+        if measured_strength > 0
+        else 0.0
+    )
+
+    single_3.metric(
+        "Actual − AI",
+        f"{difference:+.2f} MPa",
+        delta=f"{percentage_difference:+.1f}%",
+    )
 
 
 # ============================================================
-# TAB 4 — 비용 & GWP 계산기
+# TAB 4 — COST & SUSTAINABILITY
 # ============================================================
-with tab4:
-    st.subheader("배합별 비용 & GWP 상세 분해")
-    st.caption("좌측 사이드바에서 단가/GWP 계수를 조정할 수 있습니다.")
-
-    mix_for_calc = mix  # TAB 1에서 마지막으로 입력한 배합 재사용
+with tab_sustainability:
+    st.subheader("Cost & Sustainability Assessment")
+    st.caption(
+        "현재 Mix Design 탭에 입력된 배합을 기준으로 재료별 비용과 GWP 기여도를 계산합니다."
+    )
 
     detail_rows = []
-    for f in MIX_FEATURES:
-        amt = mix_for_calc[f]
-        c = amt * st.session_state.cost_table[f]
-        g = amt * st.session_state.gwp_table[f]
-        detail_rows.append({
-            "재료": FEATURE_LABELS_KR[f],
-            "사용량 (kg/m³)": round(amt, 1),
-            "비용 ($/m³)": round(c, 3),
-            "GWP (kgCO₂e/m³)": round(g, 3),
-        })
-    df_detail = pd.DataFrame(detail_rows)
-    total_cost = df_detail["비용 ($/m³)"].sum()
-    total_gwp = df_detail["GWP (kgCO₂e/m³)"].sum()
 
-    col_a, col_b = st.columns([1.2, 1])
-    with col_a:
-        st.dataframe(df_detail, use_container_width=True, hide_index=True)
-        st.markdown(f"**합계 — 비용: ${total_cost:.2f}/m³, GWP: {total_gwp:.1f} kgCO₂e/m³**")
+    for feature in MATERIAL_FEATURES:
+        quantity = current_mix[feature]
+        material_cost = quantity * st.session_state.cost_factors[feature]
+        material_gwp = quantity * st.session_state.gwp_factors[feature]
 
-    with col_b:
-        fig = px.pie(df_detail, names="재료", values="GWP (kgCO₂e/m³)",
-                      title="재료별 GWP 기여도", hole=0.4)
-        st.plotly_chart(fig, use_container_width=True)
-
-    pred_calc, _ = predict_strength(mix_for_calc, model, scaler)
-    if pred_calc > 0:
-        st.info(
-            f"이 배합의 예측 강도는 **{pred_calc:.1f} MPa**입니다. "
-            f"MPa당 비용은 **${total_cost/pred_calc:.3f}**, MPa당 GWP는 **{total_gwp/pred_calc:.2f} kgCO₂e**입니다. "
-            "(값이 낮을수록 '단위 강도당' 효율이 좋다는 의미입니다.)"
+        detail_rows.append(
+            {
+                "Material": FEATURE_LABELS_KR[feature],
+                "Quantity (kg/m³)": round(quantity, 2),
+                "Cost ($/m³)": round(material_cost, 3),
+                "GWP (kgCO₂e/m³)": round(material_gwp, 3),
+            }
         )
 
+    detail_df = pd.DataFrame(detail_rows)
+    total_cost = float(detail_df["Cost ($/m³)"].sum())
+    total_gwp = float(detail_df["GWP (kgCO₂e/m³)"].sum())
 
-st.markdown("---")
+    sustainability_left, sustainability_right = st.columns([1.2, 1])
+
+    with sustainability_left:
+        st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+        total_1, total_2 = st.columns(2)
+        total_1.metric("Total Cost", f"${total_cost:.2f}/m³")
+        total_2.metric("Total GWP", f"{total_gwp:.1f} kgCO₂e/m³")
+
+    with sustainability_right:
+        gwp_chart = px.pie(
+            detail_df,
+            names="Material",
+            values="GWP (kgCO₂e/m³)",
+            hole=0.45,
+            title="Material Contribution to GWP",
+        )
+        st.plotly_chart(gwp_chart, use_container_width=True)
+
+    efficiency_1, efficiency_2 = st.columns(2)
+    efficiency_1.metric(
+        "Cost per MPa",
+        f"${total_cost / max(predicted_strength, 1e-6):.3f}",
+    )
+    efficiency_2.metric(
+        "GWP per MPa",
+        f"{total_gwp / max(predicted_strength, 1e-6):.2f} kgCO₂e",
+    )
+
+    st.warning(
+        "본 비용 및 GWP 결과는 예시 계수를 사용한 상대 비교용입니다. "
+        "실제 프로젝트 적용 전 공급업체 단가, 운송 조건 및 검증된 EPD 값을 반영해야 합니다."
+    )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+st.divider()
 st.caption(
-    "이 대시보드는 Day 4–5 프로젝트(UCI Concrete Compressive Strength, XGBoost R²=0.9318)를 기반으로 합니다. "
-    "비용/GWP 계수는 예시값이며 실제 프로젝트에는 검증된 데이터로 교체해야 합니다."
+    "Prototype AI-assisted engineering decision support platform · "
+    "XGBoost-based compressive strength prediction · "
+    "AI supports engineering judgment and does not replace laboratory or field validation."
 )
